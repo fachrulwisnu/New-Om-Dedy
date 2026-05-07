@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useEffect, Component, ErrorInfo } from 'react';
+import { useNavigate, Routes, Route, useLocation, useParams, Navigate } from 'react-router-dom';
 import * as XLSX from 'xlsx';
 
 const handleExcelExport = (data: any[], fileName: string) => {
@@ -21,6 +22,7 @@ import {
   FolderKanban,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   LogOut,
   Settings as SettingsIcon,
   Search,
@@ -59,6 +61,7 @@ import {
   startOfWeek,
   endOfWeek,
   eachDayOfInterval,
+  eachMonthOfInterval,
   isSameDay,
   differenceInDays,
   startOfMonth,
@@ -66,6 +69,7 @@ import {
   eachWeekOfInterval,
   isWithinInterval,
   addMonths,
+  subDays,
   isToday,
   isWeekend
 } from 'date-fns';
@@ -523,6 +527,9 @@ export default function App() {
     role: 'Product Manager'
   }) as any), [authUser]);
 
+  const navigate = useNavigate();
+  const location = useLocation();
+
   const signOut = () => {
     if (authUser) realSignOut();
     else {
@@ -530,9 +537,56 @@ export default function App() {
       // Optionally reset some local state if needed, but for bypass we stay logged in
     }
   };
-  const [activeView, setActiveView] = useState<AppView>('PROJECTS');
+
+  const [viewState, setViewState] = useState<AppView>('PROJECTS');
+  
+  // Explicitly map URL to View for legacy support and cleaner routing
+  const activeView = useMemo(() => {
+    const path = location.pathname;
+    if (path === '/') return 'PROJECTS';
+    if (path === '/portfolio') return 'PROJECTS';
+    if (path === '/kanban') return 'KANBAN';
+    if (path === '/omdedy') return 'SCHEDULE';
+    if (path === '/audit') return 'AUDIT';
+    if (path === '/personnel') return 'PERSONEL';
+    if (path === '/reschedule') return 'RESCHEDULE';
+    if (path.startsWith('/project/')) return 'GANTT_DETAIL';
+    return viewState;
+  }, [location.pathname, viewState]);
+
+  const setActiveView = (view: AppView) => {
+    setViewState(view);
+    switch(view) {
+      case 'PROJECTS': navigate('/'); break;
+      case 'KANBAN': navigate('/kanban'); break;
+      case 'SCHEDULE': navigate('/omdedy'); break;
+      case 'AUDIT': navigate('/audit'); break;
+      case 'PERSONEL': navigate('/personnel'); break;
+      case 'RESCHEDULE': navigate('/reschedule'); break;
+      case 'GANTT_DETAIL': 
+        if (selectedProjectId) navigate(`/project/${selectedProjectId}`);
+        else navigate('/');
+        break;
+    }
+  };
+
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
-  const [focusedProjectId, setFocusedProjectId] = useState<string | null>(null);
+  const [pendingRescheduleCount, setPendingRescheduleCount] = useState(0);
+
+  // Sync selectedProjectId from URL
+  useEffect(() => {
+    const match = location.pathname.match(/\/project\/(.+)/);
+    if (match) {
+      if (match[1] === 'global') {
+        setSelectedProjectId(null);
+      } else {
+        setSelectedProjectId(match[1]);
+      }
+    } else {
+      setSelectedProjectId(null);
+    }
+  }, [location.pathname]);
+
   const [notif, setNotif] = useState<string | null>(null);
   
   const [projects, setProjects] = useState<Project[]>([]);
@@ -582,12 +636,14 @@ export default function App() {
     try {
       const data = await taskService.getRescheduleRequests();
       setRescheduleRequests(data);
+      // BUG FIX: Count only pending requests for the badge
+      const pendingCount = (data || []).filter(r => r.status === 'Pending').length;
+      setPendingRescheduleCount(pendingCount);
     } catch (err) {
       console.error("Failed to fetch reschedule requests:", err);
     }
   };
   const [isCreateProjectModalOpen, setIsCreateProjectModalOpen] = useState(false);
-  const [taskModalData, setTaskModalData] = useState<{ parentId: string | null } | null>(null);
   const [reschedulingProject, setReschedulingProject] = useState<Project | null>(null);
   const [itemToDelete, setItemToDelete] = useState<{id: string, type: 'task' | 'project' | 'user' | 'phase' | 'subtask', phaseIdx?: number, subIdx?: number} | null>(null);
 
@@ -725,7 +781,59 @@ export default function App() {
   const handleUpdateTask = async (id: string, field: keyof Task, value: any) => {
     // Get existing task for audit/date check
     const task = tasks.find(t => t.id === id);
-    const oldValue = task ? task[field] : null;
+    if (!task) return;
+    const oldValue = task[field];
+
+    // --- STRICT DATE VALIDATION ---
+    if (field === 'start_time' || field === 'end_time') {
+      const newValueStr = format(new Date(String(value)), 'yyyy-MM-dd');
+      const proj = projects.find(p => p.id === task.project_id);
+      
+      // Project Bounds Check
+      if (proj && proj.start_date && proj.end_date) {
+        const pStart = format(new Date(proj.start_date), 'yyyy-MM-dd');
+        const pEnd = format(new Date(proj.end_date), 'yyyy-MM-dd');
+        if (newValueStr < pStart || newValueStr > pEnd) {
+          setNotif(`Tanggal harus dalam rentang timeline Proyek (${pStart} s/d ${pEnd})`);
+          return;
+        }
+      }
+
+      // Level 1 Validation: End date cannot be before Start date
+      if (!task.parent_id) { // Level 1 (Phase)
+        if (field === 'end_time' && task.start_time && newValueStr < format(new Date(task.start_time), 'yyyy-MM-dd')) {
+          setNotif("Tanggal selesai tidak boleh sebelum tanggal mulai!");
+          return;
+        }
+        if (field === 'start_time' && task.end_time && newValueStr > format(new Date(task.end_time), 'yyyy-MM-dd')) {
+          setNotif("Tanggal mulai tidak boleh setelah tanggal selesai!");
+          return;
+        }
+      }
+
+      // Level 2 Validation: Must stay within Parent Phase (Level 1) bounds
+      if (task.parent_id) {
+        const parent = tasks.find(t => t.id === task.parent_id);
+        if (parent && parent.start_time && parent.end_time) {
+          const pStart = format(new Date(parent.start_time), 'yyyy-MM-dd');
+          const pEnd = format(new Date(parent.end_time), 'yyyy-MM-dd');
+          
+          if (newValueStr < pStart || newValueStr > pEnd) {
+            setNotif(`Tanggal Level 2 harus dalam rentang Level 1 (${pStart} s/d ${pEnd})`);
+            return;
+          }
+        }
+        // Also check task-level consistency
+        if (field === 'end_time' && task.start_time && newValueStr < format(new Date(task.start_time), 'yyyy-MM-dd')) {
+          setNotif("Tanggal selesai tidak boleh sebelum tanggal mulai!");
+          return;
+        }
+        if (field === 'start_time' && task.end_time && newValueStr > format(new Date(task.end_time), 'yyyy-MM-dd')) {
+          setNotif("Tanggal mulai tidak boleh setelah tanggal selesai!");
+          return;
+        }
+      }
+    }
 
     // Optimistic Update
     setTasks(prev => prev.map(t => t.id === id ? { ...t, [field]: value } : t));
@@ -734,7 +842,7 @@ export default function App() {
        await taskService.updateTask(id, { [field]: value }, user?.email || 'System User');
        
        // Log to Project Reschedule Log if date changed
-       if (task && (field === 'start_time' || field === 'end_time')) {
+       if (field === 'start_time' || field === 'end_time') {
          if (oldValue !== value && task.project_id) {
            await taskService.createProjectRescheduleLog({
              project_id: task.project_id,
@@ -785,7 +893,7 @@ export default function App() {
       console.error("Delete failed:", err);
       // Revert if failed to ensure data integrity
       fetchData(); 
-      alert("CRUD Error: Gagal menghapus task. Database rejected the request.\nDetail: " + err.message);
+      setNotif("Gagal menghapus task: " + err.message);
     }
   };
 
@@ -820,6 +928,38 @@ export default function App() {
     }
   };
 
+  // --- Auto-Sync Level 1 Tasks to Project Header ---
+  useEffect(() => {
+    if (loading || projects.length === 0 || tasks.length === 0) return;
+
+    const syncProjects = async () => {
+      for (const project of projects) {
+        const l1Tasks = tasks.filter(t => t.project_id === project.id && !t.parent_id);
+        if (l1Tasks.length === 0) continue;
+
+        const startDates = l1Tasks.map(t => new Date(t.start_time).getTime());
+        const endDates = l1Tasks.map(t => new Date(t.end_time).getTime());
+        
+        const minStart = format(new Date(Math.min(...startDates)), 'yyyy-MM-dd');
+        const maxEnd = format(new Date(Math.max(...endDates)), 'yyyy-MM-dd');
+
+        if (minStart !== project.start_date || maxEnd !== project.end_date) {
+          console.log(`Syncing project ${project.name} timeline: ${minStart} to ${maxEnd}`);
+          await handleUpdateProject(project.id, {
+            start_date: minStart,
+            end_date: maxEnd
+          });
+        }
+      }
+    };
+
+    const timer = setTimeout(() => {
+      syncProjects();
+    }, 1000); // Debounce sync
+
+    return () => clearTimeout(timer);
+  }, [tasks, projects.length, loading]);
+  
   const handleUpdateProject = async (id: string, updates: Partial<Project>) => {
     // Optimistic Update
     setProjects(prev => prev.map(p => p.id === id ? { ...p, ...updates } : p));
@@ -859,7 +999,7 @@ export default function App() {
   const menuItems = useMemo(() => {
     const base = [
       { id: 'PROJECTS', label: 'Project List', icon: LayoutDashboard },
-      { id: 'GANTT_DETAIL', label: 'Timeline View', icon: Activity },
+      { id: 'GANTT_DETAIL', label: 'Om Dedy Timeline', icon: Activity },
       { id: 'KANBAN', label: 'Status Monitoring', icon: LayoutGrid },
       { id: 'SCHEDULE', label: 'Om Dedy Schedule', icon: Calendar },
       { id: 'RESCHEDULE', label: 'Reschedule Om Dedy', icon: History },
@@ -937,25 +1077,44 @@ export default function App() {
 
         <nav className="flex-1 py-6 space-y-1">
           {menuItems.map((item, i) => (
-            <button
-              key={`${item.id}-${i}`}
-              onClick={() => { setActiveView(item.id as AppView); setSelectedProjectId(null); }}
-              className={cn(
-                "w-full flex items-center py-3 px-4 transition-all relative group",
-                activeView === item.id && !selectedProjectId 
-                  ? "text-white bg-gradient-to-r from-indigo-600/20 to-transparent" 
-                  : "text-slate-400 hover:text-slate-200 hover:bg-white/5"
-              )}
-            >
-              <item.icon className={cn("w-5 h-5 shrink-0 transition-colors", activeView === item.id ? "text-indigo-400" : "text-slate-500")} />
-              {isSidebarOpen && <span className="ml-4 font-bold text-xs uppercase tracking-widest">{item.label}</span>}
-              {!isSidebarOpen && (
-                <div className="absolute left-full ml-2 px-3 py-1 bg-slate-800 text-white text-[10px] rounded opacity-0 group-hover:opacity-100 whitespace-nowrap shadow-xl pointer-events-none z-50">
-                  {item.label}
+            <React.Fragment key={`${item.id}-${i}`}>
+              <button
+                onClick={() => { setActiveView(item.id as AppView); setSelectedProjectId(null); }}
+                className={cn(
+                  "w-full flex items-center py-3 px-4 transition-all relative group",
+                  (activeView === item.id && !selectedProjectId)
+                    ? "text-white bg-gradient-to-r from-indigo-600/20 to-transparent" 
+                    : "text-slate-400 hover:text-slate-200 hover:bg-white/5"
+                )}
+              >
+                <item.icon className={cn("w-5 h-5 shrink-0 transition-colors", (activeView === item.id && !selectedProjectId) ? "text-indigo-400" : "text-slate-500")} />
+                {isSidebarOpen && <span className="ml-4 font-bold text-xs uppercase tracking-widest">{item.label}</span>}
+                {item.id === 'RESCHEDULE' && pendingRescheduleCount > 0 && (
+                  <span className={cn(
+                    "ml-auto bg-rose-500 text-white text-[8px] font-black rounded-full flex items-center justify-center animate-bounce shadow-lg ring-2 ring-slate-900 transition-all",
+                    isSidebarOpen ? "w-5 h-5" : "w-4 h-4 absolute top-1 right-1"
+                  )}>
+                    {pendingRescheduleCount}
+                  </span>
+                )}
+                {!isSidebarOpen && (
+                  <div className="absolute left-full ml-2 px-3 py-1 bg-slate-800 text-white text-[10px] rounded opacity-0 group-hover:opacity-100 whitespace-nowrap shadow-xl pointer-events-none z-50">
+                    {item.label}
+                  </div>
+                )}
+                {((activeView === item.id && !selectedProjectId)) && <div className="absolute left-0 top-0 bottom-0 w-1 bg-indigo-500" />}
+              </button>
+
+              {/* Dynamic Sub-menu for Project Detail */}
+              {item.id === 'PROJECTS' && selectedProjectId && (
+                <div className={cn("mt-1 mb-2", isSidebarOpen ? "pl-8" : "pl-4")}>
+                  <div className="flex items-center gap-2 py-2 text-[10px] font-black text-emerald-400 uppercase tracking-widest bg-emerald-500/5 border-l-2 border-emerald-500 pl-3">
+                    <div className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                    {isSidebarOpen ? 'Om Dedy - Detail Timeline' : ''}
+                  </div>
                 </div>
               )}
-              {activeView === item.id && !selectedProjectId && <div className="absolute left-0 top-0 bottom-0 w-1 bg-indigo-500" />}
-            </button>
+            </React.Fragment>
           ))}
         </nav>
 
@@ -1003,9 +1162,9 @@ export default function App() {
         )}
         <header className="h-20 border-b border-slate-800/60 flex items-center justify-between px-8 bg-slate-950/50 backdrop-blur-md z-30 shrink-0">
           <div className="flex items-center gap-4">
-             {activeView === 'GANTT_DETAIL' && focusedProjectId && (
+             {activeView === 'GANTT_DETAIL' && selectedProjectId && (
                <button 
-                 onClick={() => setFocusedProjectId(null)}
+                 onClick={() => { setActiveView('PROJECTS'); setSelectedProjectId(null); }}
                  className="p-2 hover:bg-slate-800 rounded-lg transition-colors text-slate-500 hover:text-white"
                >
                  <ArrowLeft className="w-5 h-5" />
@@ -1020,13 +1179,13 @@ export default function App() {
                  {activeView === 'SCHEDULE' && 'Om Dedy Schedule'}
                  {activeView === 'AUDIT' && 'System Audit Rails'}
                  {activeView === 'GANTT_DETAIL' && (
-                    focusedProjectId ? (
+                    selectedProjectId ? (
                       <div className="flex items-center gap-3">
-                        <span>{projects.find(p => p.id === focusedProjectId)?.name}</span>
+                        <span>{projects.find(p => p.id === selectedProjectId)?.name}</span>
                         <div className="flex items-center gap-2 not-italic">
                           {(() => {
-                            const p = projects.find(prj => prj.id === focusedProjectId);
-                            const pTasks = tasks.filter(t => t.project_id === focusedProjectId);
+                            const p = projects.find(prj => prj.id === selectedProjectId);
+                            const pTasks = tasks.filter(t => t.project_id === selectedProjectId);
                             const totalHours = pTasks.reduce((sum, t) => sum + (t.duration_hours || 0), 0);
                             return (
                               <>
@@ -1049,10 +1208,10 @@ export default function App() {
                           })()}
                         </div>
                       </div>
-                    ) : 'Global Timeline'
+                    ) : 'Om Dedy Timeline'
                   )}
                </h2>
-               <p className="text-[9px] text-slate-600 font-black uppercase tracking-[0.3em]">Operational Monitoring Dashboard for Efficient Delivery</p>
+               <p className="text-[9px] text-slate-600 font-black uppercase tracking-[0.3em]">WITH OM DEDY EVERYTHING WILL BE DELIVERED</p>
              </div>
           </div>
 
@@ -1096,7 +1255,7 @@ export default function App() {
                projects={projects} 
                tasks={tasks}
                loading={loading}
-               onOpenProject={(id) => { setSelectedProjectId(id); setFocusedProjectId(id); setActiveView('GANTT_DETAIL'); }} 
+               onOpenProject={(id) => { setSelectedProjectId(id); navigate(`/project/${id}`); }} 
                onDeleteProject={handleDeleteProject}
                onUpdateProject={handleUpdateProject}
                onCreateRequested={() => setIsCreateProjectModalOpen(true)}
@@ -1108,7 +1267,7 @@ export default function App() {
              <KanbanView 
                projects={projects} 
                tasks={tasks}
-               onOpenGantt={(id) => { setSelectedProjectId(id); setFocusedProjectId(id); setActiveView('GANTT_DETAIL'); }}
+               onOpenGantt={(id) => { setSelectedProjectId(id); navigate(`/project/${id}`); }}
                onUpdateProject={handleUpdateProject}
              />
            )}
@@ -1134,8 +1293,8 @@ export default function App() {
            {activeView === 'GANTT_DETAIL' && (
              <GanttDetailView
                user={user}
-               projectId={focusedProjectId}
-               setFocusedProjectId={setFocusedProjectId}
+               projectId={selectedProjectId}
+               setFocusedProjectId={(id: string) => navigate(`/project/${id}`)}
                projects={projects}
                tasks={tasks}
                hierarchicalTasks={hierarchicalTasks}
@@ -1268,15 +1427,6 @@ export default function App() {
           title="Konfirmasi Hapus"
           description="Apakah Anda yakin ingin menghapus data ini? Semua rincian di dalamnya juga akan ikut terhapus secara permanen. Aksi ini tidak dapat dibatalkan."
         />
-        {taskModalData && (
-          <CreateTaskModal 
-            projectId={focusedProjectId!}
-            parentId={taskModalData.parentId}
-            onClose={() => setTaskModalData(null)}
-            onSuccess={() => setRefreshKey(prev => prev + 1)}
-            user={user}
-          />
-        )}
       </AnimatePresence>
     </div>
   );
@@ -1435,147 +1585,8 @@ function ProjectRescheduleModal({ project, user, onClose, onSuccess }: { project
   );
 }
 
-function CreateTaskModal({ parentId, projectId, onClose, onSuccess, user, initialData }: { parentId: string | null, projectId: string, onClose: () => void, onSuccess: () => void, user: any, initialData?: Task }) {
-  const [title, setTitle] = useState(initialData?.title || '');
-  const [assignee, setAssignee] = useState(initialData?.assignee || '');
-  const [fromDate, setFromDate] = useState(initialData?.start_time ? format(new Date(initialData.start_time), 'yyyy-MM-dd') : format(new Date(), 'yyyy-MM-dd'));
-  const [toDate, setToDate] = useState(initialData?.end_time ? format(new Date(initialData.end_time), 'yyyy-MM-dd') : format(addDays(new Date(), 7), 'yyyy-MM-dd'));
-  const [manHours, setManHours] = useState(initialData?.duration_hours || 0);
-  const [loading, setLoading] = useState(false);
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (new Date(toDate) < new Date(fromDate)) {
-      alert('To Date cannot be earlier than From Date');
-      return;
-    }
 
-    setLoading(true);
-    try {
-      const taskData = {
-        title,
-        assignee: assignee || user?.name || user?.email || 'User',
-        project_id: projectId,
-        parent_id: parentId,
-        start_time: new Date(fromDate).toISOString(),
-        end_time: new Date(toDate).toISOString(),
-        duration_hours: Number(manHours) || 0
-      };
-
-      if (initialData?.id) {
-        await taskService.updateTask(initialData.id, taskData, user?.email || 'User');
-      } else {
-        await taskService.createTask(taskData, user?.email || 'User');
-      }
-      onSuccess();
-      onClose();
-    } catch (err: any) {
-      alert('Failed to save task: ' + err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <div className="fixed inset-0 z-[300] flex items-center justify-center p-4">
-      <motion.div 
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
-        onClick={onClose}
-        className="absolute inset-0 bg-slate-950/90 backdrop-blur-sm"
-      />
-      <motion.div 
-        initial={{ opacity: 0, scale: 0.95, y: 20 }}
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        exit={{ opacity: 0, scale: 0.95, y: 20 }}
-        className="relative w-full max-w-lg bg-slate-900 border border-white/10 rounded-3xl shadow-2xl overflow-hidden max-h-[90vh] overflow-y-auto"
-      >
-        <div className="p-6 border-b border-white/5 bg-gradient-to-br from-slate-900 to-slate-950">
-          <h3 className="text-xl font-black text-white italic uppercase tracking-tight">
-            {parentId ? 'Add Breakdown (L2)' : 'Add Phase (L1)'}
-          </h3>
-          <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest mt-1">Infrastructure Partitioning</p>
-        </div>
-
-        <form onSubmit={handleSubmit} className="p-6 space-y-5">
-          <div className="space-y-2">
-            <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest ml-1">Title / Node Name</label>
-            <input 
-              required
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3 text-sm text-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500/50 outline-none transition-all"
-              placeholder="Enter node title..."
-            />
-          </div>
-
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest ml-1">From Date</label>
-              <input 
-                type="date"
-                required
-                value={fromDate}
-                onChange={(e) => setFromDate(e.target.value)}
-                className="w-full bg-slate-900 border border-slate-700 rounded-2xl px-4 py-3 text-sm text-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500/50 outline-none transition-all"
-              />
-            </div>
-            <div className="space-y-2">
-              <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest ml-1">To Date</label>
-              <input 
-                type="date"
-                required
-                value={toDate}
-                onChange={(e) => setToDate(e.target.value)}
-                className="w-full bg-slate-900 border border-slate-700 rounded-2xl px-4 py-3 text-sm text-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500/50 outline-none transition-all"
-              />
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest ml-1">Assignee / PIC</label>
-              <input 
-                value={assignee}
-                onChange={(e) => setAssignee(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3 text-sm text-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500/50 outline-none transition-all"
-                placeholder="Assign to..."
-              />
-            </div>
-            <div className="space-y-2">
-              <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest ml-1">Est. Man-Hours</label>
-              <input 
-                type="number"
-                required
-                value={manHours}
-                onChange={(e) => setManHours(Number(e.target.value))}
-                className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3 text-sm text-white focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500/50 outline-none transition-all"
-              />
-            </div>
-          </div>
-
-          <div className="pt-4 flex gap-4">
-            <button 
-              type="button"
-              onClick={onClose}
-              className="flex-1 py-3 bg-slate-800/50 hover:bg-slate-800 text-slate-400 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all border border-white/5"
-            >
-              Cancel
-            </button>
-            <button 
-              type="submit"
-              disabled={loading}
-              className="flex-[2] py-3 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-[10px] font-black uppercase tracking-widest rounded-xl shadow-xl shadow-emerald-600/20 transition-all active:scale-[0.98] disabled:opacity-50"
-            >
-              {loading ? 'Creating...' : 'Finalize Persistence'}
-            </button>
-          </div>
-        </form>
-      </motion.div>
-    </div>
-  );
-}
 
 function CreateProjectModal({ onClose, onSuccess, user, users }: { onClose: () => void, onSuccess: () => void, user: any, users: AppUser[] }) {
   const [title, setTitle] = useState('');
@@ -1932,11 +1943,9 @@ function CreateProjectModal({ onClose, onSuccess, user, users }: { onClose: () =
                       </button>
                       <button 
                         onClick={() => {
-                          if (confirm('Apakah Anda yakin ingin menghapus data ini? Semua rincian di dalamnya juga akan terhapus secara permanen.')) {
-                            const newPhases = [...phases];
-                            newPhases.splice(pIdx, 1);
-                            setPhases(newPhases);
-                          }
+                          const newPhases = [...phases];
+                          newPhases.splice(pIdx, 1);
+                          setPhases(newPhases);
                         }}
                         className="p-2 hover:bg-rose-500/10 text-slate-700 hover:text-rose-500 rounded-lg transition-all"
                         title="Delete Phase"
@@ -2066,11 +2075,9 @@ function CreateProjectModal({ onClose, onSuccess, user, users }: { onClose: () =
                           <div className="flex justify-center">
                             <button 
                               onClick={() => {
-                                if (confirm('Apakah Anda yakin ingin menghapus data ini? Semua rincian di dalamnya juga akan terhapus secara permanen.')) {
-                                  const newPhases = [...phases];
-                                  newPhases[pIdx].subtasks.splice(sIdx, 1);
-                                  setPhases(newPhases);
-                                }
+                                const newPhases = [...phases];
+                                newPhases[pIdx].subtasks.splice(sIdx, 1);
+                                setPhases(newPhases);
                               }}
                               className="p-1.5 opacity-0 group-hover/sub:opacity-100 hover:bg-rose-500/10 text-slate-700 hover:text-rose-500 rounded transition-all"
                             >
@@ -2499,7 +2506,7 @@ function PortfolioDashboard({ projects, tasks, loading, onOpenProject, onDeleteP
                   <div className="flex items-center gap-2 text-[9px] font-bold text-slate-500 uppercase tracking-widest">
                     <Clock className="w-3 h-3 text-slate-600" />
                     <span>Timeline: <span className="text-slate-300 font-mono tracking-tighter">
-                      {p.start_date ? format(new Date(p.start_date), 'MMM dd') : '??'} - {p.end_date ? format(new Date(p.end_date), 'MMM dd, yyyy') : '??'}
+                      {p.start_date ? format(new Date(p.start_date), 'MMM dd') : 'Belum Set'} - {p.end_date ? format(new Date(p.end_date), 'MMM dd, yyyy') : 'Belum Set'}
                     </span></span>
                   </div>
                 </div>
@@ -2893,9 +2900,9 @@ function OmDedySchedule({ user, users, setActiveView }: { user: any, users: AppU
               >
                 <History className="w-4 h-4" />
                 Reschedule
-                {rescheduleRequests.length > 0 && (
+                {rescheduleRequests.filter(r => r.status === 'Pending').length > 0 && (
                   <span className="absolute -top-1 -right-1 w-4 h-4 bg-rose-500 text-white text-[8px] rounded-full flex items-center justify-center animate-bounce shadow-lg ring-2 ring-slate-950">
-                    {rescheduleRequests.length}
+                    {rescheduleRequests.filter(r => r.status === 'Pending').length}
                   </span>
                 )}
               </button>
@@ -3871,14 +3878,64 @@ function GanttDetailView({
   setRefreshKey, handleToggleExpand, handleUpdateTask, handleOpenAudit, handleDeleteTask, 
   setScale, setTasks, onReschedule 
 }: any) {
-  const [isAdding, setIsAdding] = useState(false);
-  const [taskModalData, setTaskModalData] = useState<{ parentId: string | null } | null>(null);
+  const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<'TASKS' | 'AUDIT'>('TASKS');
   const [rescheduleLogs, setRescheduleLogs] = useState<ProjectRescheduleLog[]>([]);
   // If projectId is null, we show the high-level Global Gantt
   const isGlobalView = !projectId;
   
   const currentProject = (projects || []).find((p: any) => p.id === projectId);
+
+  const handleAddInlineL1 = async () => {
+    if (!projectId) return;
+    const defaultL1 = {
+      project_id: projectId,
+      parent_id: null,
+      title: '', // Empty ready to be typed
+      duration_hours: 0,
+      status: TaskStatus.ON_PROGRESS,
+      start_time: new Date().toISOString(),
+      end_time: addDays(new Date(), 1).toISOString(),
+      assignee: user?.name || '',
+    };
+    try {
+      const { data, error } = await supabase.from('tasks').insert([defaultL1]).select().single();
+      if (error) throw error;
+      if (data) {
+        setTasks((prev: Task[]) => [...prev, data]);
+      }
+    } catch (err: any) {
+      console.error("Failed to add inline L1:", err);
+    }
+  };
+
+  const handleAddInlineL2 = async (parentId: string) => {
+    if (!projectId) return;
+    const parent = tasks.find((t: any) => t.id === parentId);
+    const defaultL2 = {
+      project_id: projectId,
+      parent_id: parentId,
+      title: '', // Empty ready to be typed
+      duration_hours: 0,
+      status: TaskStatus.ON_PROGRESS,
+      start_time: parent?.start_time || new Date().toISOString(),
+      end_time: parent?.end_time || addDays(new Date(), 1).toISOString(),
+      assignee: user?.name || '',
+    };
+    try {
+      const { data, error } = await supabase.from('tasks').insert([defaultL2]).select().single();
+      if (error) throw error;
+      if (data) {
+        setTasks((prev: Task[]) => [...prev, data]);
+        // Expand parent if not expanded
+        if (!expandedRows.has(parentId)) {
+          handleToggleExpand(parentId);
+        }
+      }
+    } catch (err: any) {
+      console.error("Failed to add inline L2:", err);
+    }
+  };
 
   const projectStats = useMemo(() => {
     if (!projectId || !tasks) return { minStart: null, maxEnd: null, totalManHours: 0 };
@@ -3889,14 +3946,19 @@ function GanttDetailView({
     const minStart = validDates.length > 0 ? new Date(Math.min(...validDates.map(d => new Date(d).getTime()))) : null;
     const maxEnd = validDates.length > 0 ? new Date(Math.max(...validDates.map(d => new Date(d).getTime()))) : null;
     
+    const totalTasks = pTasks.filter((tValue: any) => !tValue.parent_id).length;
+    const totalChildTasks = pTasks.filter((tValue: any) => tValue.parent_id).length;
+    
     const totalManHours = pTasks
-      .filter((t: any) => !t.parent_id) // Level 1 only
-      .reduce((sum, t) => sum + (Number(t.duration_hours) || 0), 0);
+      .filter((tValue: any) => !tValue.parent_id) // Level 1 only
+      .reduce((sum, tValue) => sum + (Number(tValue.duration_hours) || 0), 0);
 
     return { 
       minStart, 
       maxEnd, 
-      totalManHours 
+      totalManHours,
+      totalTasks,
+      totalChildTasks
     };
   }, [tasks, projectId]);
 
@@ -3929,8 +3991,14 @@ function GanttDetailView({
         const startTimes = pTasks.map(t => new Date(t.start_time).getTime());
         const endTimes = pTasks.map(t => new Date(t.end_time).getTime());
         
-        const minStart = startTimes.length > 0 ? Math.min(...startTimes) : new Date(p.created_at).getTime();
-        const maxEnd = endTimes.length > 0 ? Math.max(...endTimes) : new Date(p.created_at).getTime() + (24 * 3600000); // +1 day if no tasks
+        const minStart = startTimes.length > 0 ? Math.min(...startTimes) : (p.start_date ? new Date(p.start_date).getTime() : new Date(p.created_at).getTime());
+        const maxEnd = endTimes.length > 0 ? Math.max(...endTimes) : (p.end_date ? new Date(p.end_date).getTime() : new Date(p.created_at).getTime() + (24 * 3600000));
+
+        // Get phases (L1 tasks) for this project
+        const projectPhases = pTasks.filter(t => !t.parent_id).map(l1 => {
+           const subtasks = pTasks.filter(t => t.parent_id === l1.id);
+           return { ...l1, children: subtasks };
+        });
 
         return {
           id: p.id,
@@ -3941,12 +4009,13 @@ function GanttDetailView({
           end_time: new Date(maxEnd).toISOString(),
           assignee: p.pic_name || p.leader_email,
           duration_hours: Math.round((maxEnd - minStart) / 3600000),
-          duration_minutes: 0
+          duration_minutes: 0,
+          children: projectPhases // Children are Level 1 tasks
         };
       });
       
       const map = new Map();
-      globalRoots.forEach(r => map.set(r.id, [])); // No children displayed in high-level Gantt generally, OR we could show phases
+      globalRoots.forEach(r => map.set(r.id, r)); 
       
       return { roots: globalRoots, map };
     }
@@ -3991,9 +4060,17 @@ function GanttDetailView({
     return (
       <div className="h-full flex items-center justify-center bg-[#020617] text-slate-500 font-bold uppercase tracking-widest flex-col gap-4">
         <div className="w-12 h-12 rounded-full border-2 border-slate-800 flex items-center justify-center opacity-50">
-          <Clock className="w-6 h-6" />
+          <Plus className="w-6 h-6" />
         </div>
         Timeline Partition Empty
+        {!isGlobalView && (
+           <button 
+             onClick={handleAddInlineL1}
+             className="mt-4 bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest flex items-center gap-2"
+           >
+             <Plus className="w-4 h-4" /> Add First Phase (L1)
+           </button>
+        )}
       </div>
     );
   }
@@ -4011,8 +4088,8 @@ function GanttDetailView({
        >
           {/* TOP: Task Manager (Only in Detail View) */}
           {!isGlobalView && (
-            <div className="h-[45%] flex flex-col bg-slate-950/20 border border-slate-800/60 rounded-2xl m-4 overflow-hidden shadow-2xl shrink-0">
-              <div className="p-4 border-b border-slate-800/60 flex items-center justify-between bg-slate-900/40">
+            <div className="h-[45%] flex flex-col bg-slate-950/20 border border-slate-800/60 rounded-2xl sm:m-4 overflow-hidden shadow-2xl shrink-0">
+      <div className="p-4 border-b border-slate-800/60 flex flex-wrap items-center justify-between bg-zinc-900/40 gap-4">
                 <div className="flex items-center gap-6">
                   <div className="flex bg-slate-950 p-1 rounded-xl border border-white/5">
                     <button 
@@ -4035,41 +4112,48 @@ function GanttDetailView({
                     </button>
                   </div>
 
-                  {currentProject && (
-                    <div className="flex items-center gap-4 pl-4 border-l border-white/5">
-                      <button 
-                         onClick={handleExportWBS}
-                         className="bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-1.5 rounded-lg text-[8px] font-black uppercase tracking-widest flex items-center gap-2 border border-slate-700 transition-all active:scale-95"
-                      >
-                        <Download className="w-3.5 h-3.5" /> Export WBS
-                      </button>
+                   {currentProject && (
+                    <div className="flex flex-wrap items-center gap-4 pl-4 border-l border-white/5">
+                      {/* Summary Cards */}
+                      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-3 gap-2 w-full lg:w-auto">
+                        <div className="bg-zinc-900/50 border border-white/5 px-2 py-2 rounded-xl flex flex-col items-center min-w-[55px] sm:min-w-[70px]">
+                           <span className="text-[7px] text-slate-500 font-black uppercase tracking-tighter">Total</span>
+                           <span className="text-[10px] sm:text-sm text-indigo-400 font-black">{projectStats.totalTasks}</span>
+                        </div>
+                        <div className="bg-zinc-900/50 border border-white/5 px-2 py-2 rounded-xl flex flex-col items-center min-w-[55px] sm:min-w-[70px]">
+                           <span className="text-[7px] text-slate-500 font-black uppercase tracking-tighter">Child</span>
+                           <span className="text-[10px] sm:text-sm text-violet-400 font-black">{projectStats.totalChildTasks}</span>
+                        </div>
+                        <div className="bg-zinc-900/50 border border-white/10 px-2 py-2 rounded-xl flex flex-col items-center min-w-[55px] sm:min-w-[70px] shadow-lg shadow-indigo-500/5">
+                           <span className="text-[7px] text-slate-500 font-black uppercase tracking-tighter">Hours</span>
+                           <span className="text-[10px] sm:text-sm text-emerald-400 font-black">{projectStats.totalManHours.toFixed(0)}</span>
+                        </div>
+                      </div>
+
                       <div className="flex flex-col">
-                        <span className="text-[8px] font-bold text-slate-500 uppercase tracking-widest leading-none mb-1">
-                          {currentProject.pic_name || currentProject.leader_email || 'Lead PIC'} 
-                          <span className="ml-2 text-sm text-slate-300 normal-case font-medium">
-                            | 📅 {displayStart} s/d {displayEnd} | ⏱️ {projectStats.totalManHours.toFixed(1)} Hours
-                          </span>
-                        </span>
-                        <div className="flex items-center gap-3">
-                           <div className="flex items-center gap-2 bg-slate-950 px-3 py-1 rounded-lg border border-white/5 shadow-inner">
-                             <Calendar className="w-3 h-3 text-indigo-400" />
-                             <span className="text-[10px] text-indigo-100 font-mono italic">
+                        <div className="flex flex-wrap items-center gap-3">
+                           <div className="flex items-center gap-2 bg-slate-950 px-3 py-1.5 rounded-lg border border-white/5 shadow-inner">
+                             <Calendar className="w-3.5 h-3.5 text-indigo-400" />
+                             <span className="text-[9px] sm:text-[10px] text-indigo-100 font-mono italic font-bold whitespace-nowrap">
                                {displayStart} - {displayEnd}
                              </span>
                            </div>
-                           <div className="flex items-center gap-1.5 bg-indigo-500/10 px-3 py-1 rounded-lg border border-indigo-500/20">
-                             <Clock className="w-3 h-3 text-indigo-400" />
-                             <span className="text-[10px] text-indigo-300 font-black tracking-tight italic">
-                               {projectStats.totalManHours.toFixed(1)} hrs
-                             </span>
+                           <div className="flex items-center gap-2">
+                             <button 
+                               onClick={() => onReschedule(currentProject)}
+                               className="p-2 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-indigo-400 rounded-lg transition-colors border border-white/5 shadow-lg"
+                               title="Reschedule Project Timeline"
+                             >
+                               <ArrowDown className="w-3.5 h-3.5 rotate-[-90deg]" />
+                             </button>
+                             <button 
+                               onClick={handleExportWBS}
+                               className="bg-indigo-600/10 hover:bg-indigo-600/20 text-indigo-400 p-2 rounded-lg border border-indigo-500/20 transition-all"
+                               title="Export to Excel"
+                             >
+                               <Download className="w-3.5 h-3.5" />
+                             </button>
                            </div>
-                           <button 
-                             onClick={() => onReschedule(currentProject)}
-                             className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-indigo-400 rounded-lg transition-colors border border-white/5"
-                             title="Reschedule Project Timeline"
-                           >
-                             <ArrowDown className="w-3.5 h-3.5 rotate-[-90deg]" />
-                           </button>
                         </div>
                       </div>
                     </div>
@@ -4078,47 +4162,39 @@ function GanttDetailView({
                 
                 {activeTab === 'TASKS' && (
                   <button 
-                    onClick={() => setTaskModalData({ parentId: null })}
-                    className="bg-emerald-600 hover:bg-emerald-500 text-white px-4 py-2 rounded-xl text-[9px] font-black uppercase tracking-widest shadow-lg shadow-emerald-500/20 shadow-lg shadow-indigo-500/20 transition-all active:scale-95 flex items-center gap-2"
+                    onClick={handleAddInlineL1}
+                    className="bg-indigo-600 hover:bg-indigo-500 text-white px-5 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest shadow-xl shadow-indigo-600/20 transition-all active:scale-95 flex items-center gap-2 border border-indigo-400/30"
                   >
-                    <Plus className="w-3.5 h-3.5" />
-                    New Infrastructure Node
+                    <Plus className="w-4 h-4" />
+                    + Add New Phase (L1)
                   </button>
                 )}
               </div>
               
               <div className="flex-1 overflow-auto scrollbar-hide bg-slate-950/40 relative">
                 {activeTab === 'TASKS' ? (
-                  <GanttTree 
-                    user={user}
-                    users={users}
-                    roots={filteredHierarchy.roots} 
-                    map={filteredHierarchy.map} 
-                    tasks={filteredTasks}
-                    projects={projects}
-                    expandedRows={expandedRows}
-                    onToggleExpand={handleToggleExpand}
-                    onUpdateTask={handleUpdateTask}
-                    onOpenAudit={handleOpenAudit}
-                    onDeleteTask={handleDeleteTask}
-                    onAddSubTask={(parentId: string) => {
-                      setTaskModalData({ parentId });
-                    }}
-                  />
+                  <div className="w-full overflow-x-auto scrollbar-hide">
+                    <div className="min-w-[800px]">
+                      <GanttTree 
+                        user={user}
+                        users={users}
+                        roots={filteredHierarchy.roots} 
+                        map={filteredHierarchy.map} 
+                        tasks={filteredTasks}
+                        projects={projects}
+                        expandedRows={expandedRows}
+                        onToggleExpand={handleToggleExpand}
+                        onUpdateTask={handleUpdateTask}
+                        onOpenAudit={handleOpenAudit}
+                        onDeleteTask={handleDeleteTask}
+                        onAddSubTask={handleAddInlineL2}
+                      />
+                    </div>
+                  </div>
                 ) : (
                   <div className="p-8">
                      <AuditLogTable logs={rescheduleLogs} />
                   </div>
-                )}
-
-                {taskModalData && (
-                  <CreateTaskModal 
-                    projectId={projectId!}
-                    parentId={taskModalData.parentId}
-                    onClose={() => setTaskModalData(null)}
-                    onSuccess={() => setRefreshKey((prev: any) => prev + 1)}
-                    user={user}
-                  />
                 )}
               </div>
             </div>
@@ -4128,8 +4204,8 @@ function GanttDetailView({
          {isGlobalView && (
            <div className="p-6 bg-slate-950/20 border-b border-slate-800/40 flex items-center justify-between mx-4 mt-4 rounded-2xl">
               <div>
-                <h3 className="text-white font-black uppercase italic tracking-tighter text-lg">Portfolio Timeline Overview</h3>
-                <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest mt-1">Cross-Project Resource Analysis</p>
+                <h3 className="text-white font-black uppercase italic tracking-tighter text-lg">Om Dedy Timeline Overview</h3>
+                
               </div>
               <div className="flex gap-6">
                 <div className="flex items-center gap-2">
@@ -4178,12 +4254,11 @@ function GanttDetailView({
                   tasks={filteredTasks} 
                   hierarchicalTasks={filteredHierarchy}
                   expandedRows={expandedRows}
+                  onToggleExpand={handleToggleExpand}
                   setTasks={setTasks} 
                   projects={projects}
                   isGlobalView={isGlobalView}
-                  onSetFocus={(id) => {
-                    setFocusedProjectId(id);
-                  }}
+                  onSetFocus={(id: string) => navigate(`/project/${id}`)}
                 />
              </div>
            </div>
@@ -4275,7 +4350,7 @@ function AddPersonnelModal({
         initial={{ opacity: 0, scale: 0.9, y: 20 }}
         animate={{ opacity: 1, scale: 1, y: 0 }}
         exit={{ opacity: 0, scale: 0.9, y: 20 }}
-        className="relative w-full max-w-md bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl overflow-hidden"
+        className="relative w-[95%] max-w-2xl bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl overflow-hidden"
       >
         <div className="p-8 border-b border-white/5 bg-slate-900/50">
           <h3 className="text-2xl font-black text-white italic tracking-tighter uppercase">Onboard Personnel</h3>
@@ -4406,7 +4481,7 @@ function EditPersonnelModal({
         initial={{ opacity: 0, scale: 0.9, y: 20 }}
         animate={{ opacity: 1, scale: 1, y: 0 }}
         exit={{ opacity: 0, scale: 0.9, y: 20 }}
-        className="relative w-full max-w-md bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl overflow-hidden"
+        className="relative w-[95%] max-w-2xl bg-slate-900 border border-slate-800 rounded-3xl shadow-2xl overflow-hidden"
       >
         <div className="p-8 border-b border-white/5 bg-slate-900/50">
           <h3 className="text-2xl font-black text-white italic tracking-tighter uppercase">Edit Personnel</h3>
@@ -4963,6 +5038,7 @@ function GanttTree({ user, users, roots, map, tasks, projects, expandedRows, onT
     const children = task.children || [];
     const isProject = !!task.isProject;
     const health = getTaskHealth(task);
+    const proj = projects.find((p: any) => p.id === task.project_id) || (isProject ? task : null);
 
     return (
       <React.Fragment key={`task-node-${task.id || `${level}-${index}`}`}>
@@ -4982,8 +5058,8 @@ function GanttTree({ user, users, roots, map, tasks, projects, expandedRows, onT
               "flex items-center gap-3",
               level === 1 ? "pl-10" : level > 1 ? "pl-16" : "pl-0"
             )}>
-              {!isProject && children.length > 0 && (
-                <span className="text-indigo-500 font-mono w-4">
+              {(isProject || children.length > 0) && (
+                <span className="text-indigo-500 font-mono w-4" onClick={() => onToggleExpand(task.id)}>
                   {isExpanded ? "▼" : "▶"}
                 </span>
               )}
@@ -4993,7 +5069,8 @@ function GanttTree({ user, users, roots, map, tasks, projects, expandedRows, onT
                   <EditableInput 
                     value={task.title} 
                     onSave={(v) => onUpdateTask(task.id, 'title', v)}
-                    className="text-xs font-black text-white italic truncate tracking-tight uppercase bg-transparent outline-none border-none focus:text-indigo-400"
+                    className="text-xs font-black text-white italic truncate tracking-tight uppercase bg-transparent outline-none border-none focus:ring-1 focus:ring-emerald-500 w-full"
+                    placeholder="ENTER TASK NAME..."
                   />
                   <HealthBadge health={health} />
                   {(() => {
@@ -5100,6 +5177,8 @@ function GanttTree({ user, users, roots, map, tasks, projects, expandedRows, onT
                 type="date" 
                 value={task.start_time ? format(new Date(task.start_time), "yyyy-MM-dd") : ''}
                 onChange={(e) => onUpdateTask(task.id, 'start_time', new Date(e.target.value).toISOString())}
+                min={parentTask ? format(new Date(parentTask.start_time), "yyyy-MM-dd") : (proj?.start_date ? format(new Date(proj.start_date), "yyyy-MM-dd") : '')}
+                max={task.end_time ? format(new Date(task.end_time), "yyyy-MM-dd") : (parentTask ? format(new Date(parentTask.end_time), "yyyy-MM-dd") : (proj?.end_date ? format(new Date(proj.end_date), "yyyy-MM-dd") : ''))}
                 className="bg-slate-900 border border-slate-700 text-[10px] text-white font-mono focus:text-indigo-400 outline-none w-full text-center cursor-pointer font-bold rounded px-1 py-0.5"
               />
               <span className="text-[7px] text-indigo-500/50 font-black uppercase opacity-0 group-hover/date:opacity-100 transition-all absolute -top-1">Start</span>
@@ -5121,6 +5200,8 @@ function GanttTree({ user, users, roots, map, tasks, projects, expandedRows, onT
                 type="date" 
                 value={task.end_time ? format(new Date(task.end_time), "yyyy-MM-dd") : ''}
                 onChange={(e) => onUpdateTask(task.id, 'end_time', new Date(e.target.value).toISOString())}
+                min={task.start_time ? format(new Date(task.start_time), "yyyy-MM-dd") : (parentTask ? format(new Date(parentTask.start_time), "yyyy-MM-dd") : (proj?.start_date ? format(new Date(proj.start_date), "yyyy-MM-dd") : ''))}
+                max={parentTask ? format(new Date(parentTask.end_time), "yyyy-MM-dd") : (proj?.end_date ? format(new Date(proj.end_date), "yyyy-MM-dd") : '')}
                 className="bg-slate-900 border border-slate-700 text-[10px] text-white font-mono focus:text-indigo-400 outline-none w-full text-center cursor-pointer font-bold rounded px-1 py-0.5"
               />
               <span className="text-[7px] text-indigo-500/50 font-black uppercase opacity-0 group-hover/date:opacity-100 transition-all absolute -top-1">End</span>
@@ -5172,10 +5253,10 @@ function GanttTree({ user, users, roots, map, tasks, projects, expandedRows, onT
             <div className="flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100 transition-opacity" onClick={e => e.stopPropagation()}>
               {!isProject && level === 0 && (
                 <button 
-                  onClick={() => onAddSubTask(task.id, task.start_time, task.end_time)}
+                  onClick={() => onAddSubTask(task.id)}
                   className="bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white text-[8px] font-black uppercase px-2 py-1 rounded shadow-lg shadow-indigo-500/20 transition-all border border-white/10 active:scale-95"
                 >
-                  + Breakdown
+                  + Sub-task
                 </button>
               )}
               <button 
@@ -5185,11 +5266,7 @@ function GanttTree({ user, users, roots, map, tasks, projects, expandedRows, onT
                 <History className="w-3.5 h-3.5" />
               </button>
               <button 
-                onClick={() => {
-                  if (confirm('Decommission this node permanently?')) {
-                    onDeleteTask(task.id);
-                  }
-                }}
+                onClick={() => onDeleteTask(task.id)}
                 className="p-1.5 bg-slate-800 hover:bg-rose-500/20 text-slate-600 hover:text-rose-500 rounded-lg transition-all border border-slate-700"
               >
                 <Trash2 className="w-3.5 h-3.5" />
@@ -5235,139 +5312,111 @@ function GanttTree({ user, users, roots, map, tasks, projects, expandedRows, onT
   );
 }
 
-function GanttTimeline({ user, scale, tasks, hierarchicalTasks, expandedRows, setTasks, projects, isGlobalView, onSetFocus }: { user: any, scale: ViewScale, tasks: Task[], hierarchicalTasks: any, expandedRows: Set<string>, setTasks: React.Dispatch<React.SetStateAction<Task[]>>, projects: Project[], isGlobalView?: boolean, onSetFocus?: (id: string) => void }) {
-  // Use current month as center
-  const now = new Date();
-  
-  const intervals = useMemo(() => {
-    switch(scale) {
-      case 'HOUR': {
-        const start = startOfDay(now);
-        return eachHourOfInterval({ start, end: endOfDay(now) });
-      }
-      case 'DAY': {
-        const start = startOfMonth(now);
-        // Show 45 days to cover the templates comfortably
-        return Array.from({ length: 45 }).map((_, i) => addDays(start, i));
-      }
-      case 'WEEK': {
-        const start = startOfMonth(now);
-        return eachWeekOfInterval({ start, end: addMonths(start, 3) });
-      }
-      case 'MONTH': {
-        return Array.from({ length: 12 }).map((_, i) => addMonths(startOfMonth(now), i));
-      }
+function GanttTimeline({ user, scale, tasks, hierarchicalTasks, expandedRows, onToggleExpand, setTasks, projects, isGlobalView, onSetFocus }: { user: any, scale: ViewScale, tasks: Task[], hierarchicalTasks: any, expandedRows: Set<string>, onToggleExpand: (id: string) => void, setTasks: React.Dispatch<React.SetStateAction<Task[]>>, projects: Project[], isGlobalView?: boolean, onSetFocus?: (id: string) => void }) {
+  const { gridStart, gridEnd, intervals, totalDuration } = useMemo(() => {
+    if (!tasks || tasks.length === 0) {
+      const now = new Date();
+      const start = startOfDay(now);
+      const end = endOfDay(now);
+      return { 
+        gridStart: start, 
+        gridEnd: end, 
+        intervals: [start], 
+        totalDuration: 1 
+      };
     }
-  }, [scale]);
+
+    const validDates = tasks.flatMap(t => [
+      t.start_time ? new Date(t.start_time).getTime() : null,
+      t.end_time ? new Date(t.end_time).getTime() : null
+    ]).filter((t): t is number => t !== null);
+
+    const minTs = Math.min(...validDates);
+    const maxTs = Math.max(...validDates);
+    
+    // Add 5 days buffer
+    const start = subDays(new Date(minTs), 5);
+    const end = addDays(new Date(maxTs), 5);
+
+    let generatedIntervals: Date[] = [];
+    switch(scale) {
+      case 'HOUR':
+        generatedIntervals = eachHourOfInterval({ start: startOfDay(start), end: endOfDay(end) });
+        break;
+      case 'DAY':
+        generatedIntervals = eachDayOfInterval({ start: startOfDay(start), end: endOfDay(end) });
+        break;
+      case 'WEEK':
+        generatedIntervals = eachWeekOfInterval({ start: startOfWeek(start, { weekStartsOn: 1 }), end: endOfWeek(end, { weekStartsOn: 1 }) });
+        break;
+      case 'MONTH':
+        generatedIntervals = eachMonthOfInterval({ start: startOfMonth(start), end: endOfMonth(end) });
+        break;
+      default:
+        generatedIntervals = [start];
+    }
+
+    return {
+      gridStart: generatedIntervals[0],
+      gridEnd: generatedIntervals[generatedIntervals.length - 1],
+      intervals: generatedIntervals,
+      totalDuration: generatedIntervals[generatedIntervals.length - 1].getTime() - generatedIntervals[0].getTime() || 1
+    };
+  }, [tasks, scale]);
 
   const CELL_WIDTH = scale === 'HOUR' ? 80 : 100;
+  const gridWidth = intervals.length * CELL_WIDTH;
 
   return (
-    <div className="flex h-full min-w-full">
-      {/* Left Column: Task/Project Labels */}
-      <div className="w-[200px] border-r border-slate-800 bg-slate-950/80 sticky left-0 z-30 flex flex-col shrink-0">
-        <div className="h-10 border-b border-white/5 flex items-center px-4 bg-slate-900/90 sticky top-0">
-          <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Entity / Scope</span>
-        </div>
-        <div className="flex-1">
-          {(hierarchicalTasks.roots || []).map((root: any, i: number) => {
-             const isExpanded = expandedRows.has(root.id);
-             const rootUniqueId = root.id || `root-fallback-${i}-${crypto.randomUUID()}`;
-             return (
-               <div key={`label-root-${rootUniqueId}`} className="flex flex-col">
-                  <div className={cn(
-                    "flex items-center px-4 border-b border-white/[0.02] text-white/70 font-bold text-[10px] uppercase truncate tracking-tighter",
-                    isGlobalView ? "h-[64px]" : "h-[56px]"
-                  )}>
-                    {root.title}
-                  </div>
-                  {!isGlobalView && isExpanded && (root.children || []).map((child: any, ci: number) => {
-                    const childUniqueId = child.id || `child-fallback-${ci}-${crypto.randomUUID()}`;
-                    return (
-                      <div key={`label-child-${childUniqueId}`} className="h-[48px] flex items-center px-4 pl-8 border-b border-white/[0.01] text-slate-500 text-[9px] font-medium truncate italic">
-                        ↳ {child.title}
-                      </div>
-                    );
-                  })}
-               </div>
-             );
-          })}
-        </div>
-      </div>
-
-      <div className="flex-1 overflow-visible">
-        {/* Time Header matches sticky height of Tree Header */}
-        <div className="flex sticky top-0 bg-slate-900/90 backdrop-blur-md border-b border-white/5 z-20 h-10">
-          {(intervals || []).map((dt, i) => {
-            if (!dt) return null;
-            return (
-              <div 
-                key={dt.toISOString() || `interval-${i}`} 
-                style={{ width: CELL_WIDTH }}
-                className="flex-shrink-0 border-r border-white/5 flex flex-col justify-center px-3"
-              >
-                <span className="text-[10px] font-bold text-slate-500 uppercase tracking-tighter">
-                  {scale === 'HOUR' ? format(dt, 'HH:mm') : format(dt, 'MMM dd')}
-                </span>
-                <span className="text-[9px] text-slate-600 font-medium">
-                   {scale === 'HOUR' ? 'TODAY' : format(dt, 'EEEE')}
-                </span>
-              </div>
-            );
-          })}
-        </div>
-
-        {/* Grid Lines */}
-        <div className="relative">
-          <div className="absolute inset-0 flex pointer-events-none">
-            {(intervals || []).map((dt, i) => (
-              <div key={dt?.toISOString() || `grid-${i}`} style={{ width: CELL_WIDTH }} className="flex-shrink-0 border-r border-white/5" />
-            ))}
+    <div className="flex h-full w-full overflow-x-auto scrollbar-hide">
+      <div className="flex min-w-max h-full">
+        {/* Left Column: Task/Project Labels */}
+        <div className="w-[240px] border-r border-slate-800 bg-slate-950/80 sticky left-0 z-30 flex flex-col shrink-0">
+          <div className="h-10 border-b border-white/5 flex items-center px-4 bg-slate-900/90 sticky top-0">
+            <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest text-[9px] sm:text-[10px]">Entity / Scope</span>
           </div>
-
-          {/* Task Bars aligned with Tree rows */}
-          <div className="relative z-10">
+          <div className="flex-1">
             {(hierarchicalTasks.roots || []).map((root: any, i: number) => {
                const isExpanded = expandedRows.has(root.id);
-               const rootUniqueId = root.id || `timeline-root-fallback-${i}`;
+               const rootUniqueId = root.id || `root-fallback-${i}-${crypto.randomUUID()}`;
                return (
-                 <div key={`timeline-root-${rootUniqueId}-${i}`} className="flex flex-col">
-                    {/* L1 or Project Bar */}
-                    <div className={cn(
-                      "flex items-center border-b border-white/[0.02]",
-                      isGlobalView ? "h-[64px]" : "h-[56px]"
-                    )}>
-                      <GanttBar 
-                        user={user}
-                        task={root} 
-                        tasks={tasks}
-                        projects={projects}
-                        setTasks={setTasks}
-                        scale={scale} 
-                        intervals={intervals} 
-                        cellWidth={CELL_WIDTH} 
-                        isLevel1={true}
-                        isProjectBar={isGlobalView}
-                        onSetFocus={onSetFocus}
-                      />
+                 <div key={`label-root-${rootUniqueId}`} className="flex flex-col">
+                    <div 
+                      onClick={() => onToggleExpand(root.id)}
+                      className={cn(
+                        "flex items-center px-4 border-b border-white/[0.02] text-white/70 font-bold text-[10px] uppercase truncate tracking-tighter cursor-pointer hover:bg-white/5 transition-colors group",
+                        isGlobalView ? "h-[64px]" : "h-[56px]"
+                      )}
+                    >
+                      <div className="mr-2 text-indigo-500/50 group-hover:text-indigo-400 transition-colors">
+                        {isExpanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+                      </div>
+                      <span className="truncate">{root.title}</span>
                     </div>
                     
-                    {!isGlobalView && isExpanded && (root.children || []).map((child: any, ci: number) => {
-                      const childUniqueId = child.id || `timeline-child-fallback-${ci}`;
+                    {isExpanded && (root.children || []).map((child: any, ci: number) => {
+                      const isChildExpanded = expandedRows.has(child.id);
+                      const childUniqueId = child.id || `child-fallback-${ci}-${crypto.randomUUID()}`;
                       return (
-                        <div key={`timeline-child-${childUniqueId}-${ci}`} className="h-[48px] flex items-center border-b border-white/[0.01]">
-                          <GanttBar 
-                            user={user}
-                            task={child} 
-                            tasks={tasks}
-                            projects={projects}
-                            setTasks={setTasks}
-                            scale={scale} 
-                            intervals={intervals} 
-                            cellWidth={CELL_WIDTH} 
-                            isLevel1={false}
-                          />
-                        </div>
+                        <React.Fragment key={`label-group-child-${childUniqueId}`}>
+                          <div 
+                            onClick={() => onToggleExpand(child.id)}
+                            className={cn(
+                              "h-[48px] flex items-center px-4 pl-8 border-b border-white/[0.01] text-slate-500 text-[9px] font-medium truncate italic cursor-pointer hover:bg-white/5 transition-colors group"
+                            )}
+                          >
+                            <div className="mr-2 opacity-50 group-hover:opacity-100">
+                              {(child.children && child.children.length > 0) ? (isChildExpanded ? <ChevronDown className="w-2.5 h-2.5" /> : <ChevronRight className="w-2.5 h-2.5" />) : null}
+                            </div>
+                            ↳ {child.title}
+                          </div>
+                          
+                          {isChildExpanded && (child.children || []).map((sub: any, si: number) => (
+                             <div key={`label-sub-${sub.id || si}`} className="h-[40px] flex items-center px-4 pl-12 border-b border-white/[0.005] text-slate-600 text-[8px] font-medium truncate opacity-70">
+                                ↳ {sub.title}
+                             </div>
+                          ))}
+                        </React.Fragment>
                       );
                     })}
                  </div>
@@ -5375,73 +5424,175 @@ function GanttTimeline({ user, scale, tasks, hierarchicalTasks, expandedRows, se
             })}
           </div>
         </div>
+
+        <div className="flex-1 overflow-visible relative" style={{ width: gridWidth }}>
+          {/* Time Header matches sticky height of Tree Header */}
+          <div className="flex sticky top-0 bg-slate-900/90 backdrop-blur-md border-b border-white/5 z-20 h-10">
+            {(intervals || []).map((dt, i) => {
+              if (!dt) return null;
+              return (
+                <div 
+                  key={dt.toISOString() || `interval-${i}`} 
+                  style={{ width: CELL_WIDTH }}
+                  className="flex-shrink-0 border-r border-white/5 flex flex-col justify-center px-3"
+                >
+                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-tighter">
+                    {scale === 'HOUR' ? format(dt, 'HH:mm') : scale === 'MONTH' ? format(dt, 'MMM yyyy') : format(dt, 'MMM dd')}
+                  </span>
+                  <span className="text-[9px] text-slate-600 font-medium">
+                     {scale === 'HOUR' ? 'TODAY' : format(dt, 'EEEE')}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Grid Lines */}
+          <div className="relative min-h-full">
+            <div className="absolute inset-0 flex pointer-events-none">
+              {(intervals || []).map((dt, i) => (
+                <div key={dt?.toISOString() || `grid-${i}`} style={{ width: CELL_WIDTH }} className="flex-shrink-0 border-r border-white/5" />
+              ))}
+            </div>
+
+            {/* Task Bars aligned with Tree rows */}
+            <div className="relative z-10 w-full">
+              {(hierarchicalTasks.roots || []).map((root: any, i: number) => {
+                 const isExpanded = expandedRows.has(root.id);
+                 const rootUniqueId = root.id || `timeline-root-fallback-${i}`;
+                 return (
+                   <div key={`timeline-root-${rootUniqueId}-${i}`} className="flex flex-col">
+                      {/* L1 or Project Bar */}
+                      <div className={cn(
+                        "flex items-center border-b border-white/[0.02] relative",
+                        isGlobalView ? "h-[64px]" : "h-[56px]"
+                      )}>
+                        <GanttBar 
+                          user={user}
+                          task={root} 
+                          tasks={tasks}
+                          projects={projects}
+                          setTasks={setTasks}
+                          scale={scale} 
+                          gridStart={gridStart}
+                          gridEnd={gridEnd}
+                          totalDuration={totalDuration}
+                          isLevel1={true}
+                          isProjectBar={root.isProject}
+                          onSetFocus={onSetFocus}
+                        />
+                      </div>
+                      
+                      {isExpanded && (root.children || []).map((child: any, ci: number) => {
+                        const isChildExpanded = expandedRows.has(child.id);
+                        const childUniqueId = child.id || `timeline-child-fallback-${ci}`;
+                        return (
+                          <React.Fragment key={`timeline-group-child-${childUniqueId}`}>
+                            <div className="h-[48px] flex items-center border-b border-white/[0.01] relative">
+                              <GanttBar 
+                                user={user}
+                                task={child} 
+                                tasks={tasks}
+                                projects={projects}
+                                setTasks={setTasks}
+                                scale={scale} 
+                                gridStart={gridStart}
+                                gridEnd={gridEnd}
+                                totalDuration={totalDuration}
+                                isLevel1={!isGlobalView}
+                                isSmall={isGlobalView}
+                              />
+                            </div>
+                            
+                            {isChildExpanded && (child.children || []).map((sub: any, si: number) => (
+                               <div key={`timeline-sub-${sub.id || si}`} className="h-[40px] flex items-center border-b border-white/[0.005] relative">
+                                 <GanttBar 
+                                    user={user}
+                                    task={sub} 
+                                    tasks={tasks}
+                                    projects={projects}
+                                    setTasks={setTasks}
+                                    scale={scale} 
+                                    gridStart={gridStart}
+                                    gridEnd={gridEnd}
+                                    totalDuration={totalDuration}
+                                    isLevel1={false}
+                                    isSmall={true}
+                                  />
+                               </div>
+                            ))}
+                          </React.Fragment>
+                        );
+                      })}
+                   </div>
+                 );
+              })}
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   );
 }
 
-function GanttBar({ user, task, tasks, projects, setTasks, scale, intervals, cellWidth, isLevel1, isProjectBar, onSetFocus }: any) {
+function GanttBar({ user, task, tasks, projects, setTasks, scale, gridStart, gridEnd, totalDuration, isLevel1, isProjectBar, onSetFocus }: any) {
   const [isDragging, setIsDragging] = useState(false);
-  const [dragOffset, setDragOffset] = useState(0);
+  const [dragOffset, setDragOffset] = useState(0); // This will now be in milliseconds for more precision
   const [showPopover, setShowPopover] = useState(false);
 
   const start = task?.start_time ? new Date(task.start_time) : new Date();
-  
-  const totalDurationMinutes = ((task.duration_hours || 0) * 60) + (task.duration_minutes || 0);
-  const end = new Date(start.getTime() + totalDurationMinutes * 60000);
-  const anchor = intervals && intervals[0] ? intervals[0] : start;
+  const totalTaskMinutes = ((task.duration_hours || 0) * 60) + (task.duration_minutes || 0);
+  const end = new Date(start.getTime() + totalTaskMinutes * 60000);
 
-  const getOffset = () => {
-    if (!anchor || !start) return 0;
-    if (scale === 'HOUR') {
-      const diffMinutes = (start.getTime() - anchor.getTime()) / 60000;
-      return (diffMinutes / 60) * cellWidth;
-    }
-    const diff = differenceInDays(start, anchor);
-    return Math.max(0, diff * cellWidth);
+  const getPosition = () => {
+    if (!gridStart || !start || !totalDuration) return { left: 0, width: 0 };
+    
+    const taskStartOffset = start.getTime() - gridStart.getTime();
+    const taskDuration = totalTaskMinutes * 60000;
+
+    const left = (taskStartOffset / totalDuration) * 100;
+    const width = (taskDuration / totalDuration) * 100;
+
+    return { 
+      left: `${Math.max(0, left)}%`, 
+      width: `${Math.max(0.5, width)}%` // Minimum 0.5% width to ensure visibility
+    };
   };
 
-  const getWidth = () => {
-    if (scale === 'HOUR') {
-      return Math.max(CELL_MIN_WIDTH, (totalDurationMinutes / 60) * cellWidth);
-    }
-    return Math.max(CELL_MIN_WIDTH, (totalDurationMinutes / 1440) * cellWidth);
-  };
-
-  const CELL_MIN_WIDTH = 10;
+  const { left, width } = getPosition();
 
   const handlePointerDown = (e: React.PointerEvent) => {
-    if (isProjectBar) return; // Project summaries are read-only
+    if (isProjectBar) return;
     if (task.status === TaskStatus.DONE) return;
+    
     setIsDragging(true);
     setShowPopover(false);
     const startX = e.clientX;
+    const containerWidth = (e.currentTarget.parentElement?.clientWidth || 1000);
     
     const handleMove = (moveEvent: PointerEvent) => {
-      const delta = moveEvent.clientX - startX;
-      const step = cellWidth / (scale === 'HOUR' ? 1 : 24);
-      const snappedDelta = Math.round(delta / step) * step;
-      setDragOffset(snappedDelta);
+      const deltaPx = moveEvent.clientX - startX;
+      // Convert pixel delta to time delta based on grid width
+      const deltaTime = (deltaPx / containerWidth) * totalDuration;
+      setDragOffset(deltaTime);
     };
 
     const handleUp = async () => {
       setIsDragging(false);
-      setDragOffset(0);
       window.removeEventListener('pointermove', handleMove);
       window.removeEventListener('pointerup', handleUp);
 
       if (dragOffset !== 0) {
-        const units = dragOffset / cellWidth;
-        const hoursDiff = scale === 'HOUR' ? units : units * 24;
-        const newStart = addHours(start, Math.round(hoursDiff));
+        const newStart = new Date(start.getTime() + dragOffset);
         
         const updatedTask = { 
           ...task, 
           start_time: newStart.toISOString(),
-          end_time: new Date(newStart.getTime() + totalDurationMinutes * 60000).toISOString() 
+          end_time: new Date(newStart.getTime() + totalTaskMinutes * 60000).toISOString() 
         };
 
         setTasks((prev: Task[]) => prev.map((t: any) => t.id === task.id ? updatedTask : t));
+        setDragOffset(0);
         
         try {
           await taskService.updateTask(task.id, {
@@ -5464,7 +5615,7 @@ function GanttBar({ user, task, tasks, projects, setTasks, scale, intervals, cel
   const health = getTaskHealth(task);
 
   const timeRemaining = Math.max(0, (end.getTime() - new Date().getTime()) / 3600000);
-  const timeProgress = Math.min(100, Math.max(0, ((new Date().getTime() - start.getTime()) / 60000 / totalDurationMinutes) * 100));
+  const timeProgress = Math.min(100, Math.max(0, ((new Date().getTime() - start.getTime()) / 60000 / totalTaskMinutes) * 100));
 
   return (
     <div className={cn("relative flex items-center", isProjectBar ? "h-16" : (isLevel1 ? "h-14" : "h-10"))}>
@@ -5472,8 +5623,8 @@ function GanttBar({ user, task, tasks, projects, setTasks, scale, intervals, cel
         layoutId={task.id}
         initial={false}
         animate={{ 
-          x: getOffset() + dragOffset, 
-          width: getWidth(),
+          left: `calc(${left} + ${(dragOffset / totalDuration) * 100}%)`, 
+          width,
           opacity: 1,
           scale: isDragging ? 1.02 : 1,
           zIndex: isDragging ? 50 : 10
