@@ -96,10 +96,15 @@ const getCollision = (currentTask: Task, allTasks: Task[], projects: Project[]) 
   const overlap = allTasks.filter(task => {
     if (task.id === currentTask.id) return false;
     
-    const start1 = new Date(currentTask.start_time);
-    const end1 = new Date(currentTask.end_time);
-    const start2 = new Date(task.start_time);
-    const end2 = new Date(task.end_time);
+    // Ignore parent-child relationship as they naturally overlap in time
+    if (task.id === currentTask.parent_id || currentTask.id === task.parent_id) return false;
+    
+    if (!currentTask.start_time || !task.start_time) return false;
+    
+    const start1 = new Date(currentTask.start_time).getTime();
+    const end1 = new Date(currentTask.end_time).getTime();
+    const start2 = new Date(task.start_time).getTime();
+    const end2 = new Date(task.end_time).getTime();
 
     const timeOverlap = start1 < end2 && end1 > start2;
     if (!timeOverlap) return false;
@@ -120,6 +125,19 @@ const getCollision = (currentTask: Task, allTasks: Task[], projects: Project[]) 
       projectName: project?.name || 'Unknown Project'
     };
   });
+};
+
+const isWBSConflict = (parent: any, child: any) => {
+  if (!parent || !child) return false;
+  if (!parent.start_time || !parent.end_time || !child.start_time || !child.end_time) return false;
+  
+  const pStart = new Date(parent.start_time).getTime();
+  const pEnd = new Date(parent.end_time).getTime();
+  const cStart = new Date(child.start_time).getTime();
+  const cEnd = new Date(child.end_time).getTime();
+
+  // It is ONLY a conflict if child starts before parent OR ends after parent
+  return (cStart < pStart || cEnd > pEnd);
 };
 
 // --- Components ---
@@ -1658,12 +1676,28 @@ function CreateProjectModal({ onClose, onSuccess, user, users }: { onClose: () =
       const finalPic = pic || user.name || user.email || 'Administrator';
       const actorName = user?.name || 'Fachrul Wisnu Novianto';
       const actorEmail = user.email || 'Administrator';
+
+      // Calculate dynamic project start and end dates from phases and subtasks
+      const allDates: number[] = [];
+      phases.forEach(p => {
+        if (p.start_date) allDates.push(new Date(`${p.start_date}T08:00:00`).getTime());
+        if (p.end_date) allDates.push(new Date(`${p.end_date}T17:00:00`).getTime());
+        p.subtasks?.forEach(s => {
+          if (s.start_date) allDates.push(new Date(`${s.start_date}T08:00:00`).getTime());
+          if (s.end_date) allDates.push(new Date(`${s.end_date}T17:00:00`).getTime());
+        });
+      });
+
+      const pStart = allDates.length > 0 ? format(new Date(Math.min(...allDates)), 'yyyy-MM-dd') : null;
+      const pEnd = allDates.length > 0 ? format(new Date(Math.max(...allDates)), 'yyyy-MM-dd') : null;
       
       const prj = await taskService.createProject({ 
         name: title, 
         status: ProjectStatus.ACTIVE,
         leader_email: user.email || null,
-        pic_name: finalPic
+        pic_name: finalPic,
+        start_date: pStart || undefined,
+        end_date: pEnd || undefined
       }, actorEmail);
       
       for (const phase of phases) {
@@ -3866,8 +3900,8 @@ function GanttDetailView({
     };
   }, [tasks, projectId]);
 
-  const displayStart = projectStats.minStart ? format(projectStats.minStart, 'yyyy-MM-dd') : 'Belum di-set';
-  const displayEnd = projectStats.maxEnd ? format(projectStats.maxEnd, 'yyyy-MM-dd') : 'Belum di-set';
+  const displayStart = projectStats.minStart ? format(projectStats.minStart, 'yyyy-MM-dd') : '-';
+  const displayEnd = projectStats.maxEnd ? format(projectStats.maxEnd, 'yyyy-MM-dd') : '-';
   
   useEffect(() => {
     if (projectId) {
@@ -3937,10 +3971,10 @@ function GanttDetailView({
     const flatList: any[] = [];
     const recurse = (t: any, level: number) => {
       flatList.push({
-        'WBS Level': `Level ${level}`,
+        'WBS Level': level === 1 ? 'Title Task' : 'Child Task',
         'Task Name': t.title || t.name || 'Untitled',
-        'From Date': t.start_time ? format(new Date(t.start_time), 'yyyy-MM-dd') : 'N/A',
-        'To Date': t.end_time ? format(new Date(t.end_time), 'yyyy-MM-dd') : 'N/A',
+        'From Date': t.start_time ? format(new Date(t.start_time), 'yyyy-MM-dd') : '-',
+        'To Date': t.end_time ? format(new Date(t.end_time), 'yyyy-MM-dd') : '-',
         'Man Hours': t.duration_hours || 0,
         'Status': t.status || 'Unknown'
       });
@@ -4923,7 +4957,7 @@ function AuditLogTable({ logs }: { logs: ProjectRescheduleLog[] }) {
 
 function GanttTree({ user, users, roots, map, tasks, projects, expandedRows, onToggleExpand, onUpdateTask, onOpenAudit, onAddSubTask, onDeleteTask }: any) {
   
-  const renderTaskRows = (task: any, level: number = 0, index: number = 0) => {
+  const renderTaskRows = (task: any, level: number = 0, index: number = 0, parentTask: any = null) => {
     if (!task) return null;
     const isExpanded = expandedRows.has(task.id);
     const children = task.children || [];
@@ -4964,7 +4998,23 @@ function GanttTree({ user, users, roots, map, tasks, projects, expandedRows, onT
                   <HealthBadge health={health} />
                   {(() => {
                     const collisions = getCollision(task, tasks, projects);
-                    return collisions ? <CollisionWarning key={`collision-${task.id}`} collisions={collisions} /> : null;
+                    const conflict = level > 0 && parentTask && isWBSConflict(parentTask, task);
+                    
+                    return (
+                      <div className="flex items-center gap-1">
+                        {collisions && <CollisionWarning key={`collision-${task.id}`} collisions={collisions} />}
+                        {conflict && (
+                          <div className="relative group/conflict inline-flex items-center justify-center ml-1">
+                            <div className="text-amber-500 animate-pulse cursor-help">
+                              <AlertTriangle className="w-4 h-4" />
+                            </div>
+                            <div className="absolute bottom-full mb-2 hidden group-hover/conflict:block w-max max-w-xs bg-slate-900 border border-amber-500/30 text-amber-200 text-[9px] rounded p-2 z-[100] shadow-xl font-bold uppercase tracking-widest leading-tight">
+                              WBS Conflict: Tanggal child task di luar range task utama!
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
                   })()}
                 </div>
                 {level === 0 && !isProject && (() => {
@@ -5150,7 +5200,7 @@ function GanttTree({ user, users, roots, map, tasks, projects, expandedRows, onT
         
         {isExpanded && (children || []).map((sub: any, sidx: number) => {
           const subKey = sub.id || `subtask-${task.id}-${sidx}-${crypto.randomUUID()}`;
-          return <React.Fragment key={subKey}>{renderTaskRows(sub, level + 1, sidx)}</React.Fragment>;
+          return <React.Fragment key={subKey}>{renderTaskRows(sub, level + 1, sidx, task)}</React.Fragment>;
         })}
       </React.Fragment>
     );
@@ -5177,7 +5227,7 @@ function GanttTree({ user, users, roots, map, tasks, projects, expandedRows, onT
         <tbody className="divide-y divide-white/5">
           {roots.map((task: any, idx: number) => {
             const taskKey = task.id || `gantt-root-${idx}-${crypto.randomUUID()}`;
-            return <React.Fragment key={taskKey}>{renderTaskRows(task, 0, idx)}</React.Fragment>;
+            return <React.Fragment key={taskKey}>{renderTaskRows(task, 0, idx, null)}</React.Fragment>;
           })}
         </tbody>
       </table>
